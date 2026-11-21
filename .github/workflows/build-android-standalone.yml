@@ -17,49 +17,11 @@ env:
   ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
 
 jobs:
-  generate-bridge:
-    name: Generate Flutter Rust Bridge
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libclang-dev clang
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_VERSION }}
-          components: rustfmt
-
-      - name: Install flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: "stable"
-          flutter-version: ${{ env.FLUTTER_VERSION }}
-
-      - name: Generate bridge
-        run: |
-          cargo install flutter_rust_bridge_codegen --version 1.80.1 --locked
-          flutter_rust_bridge_codegen --rust-input src/flutter_ffi.rs --dart-output flutter/lib/generated_bridge.dart --rust-output src/bridge_generated.rs --class-name PlatformFFI
-          git status --porcelain
-
-      - name: Upload bridge files
-        uses: actions/upload-artifact@v4
-        with:
-          name: bridge-artifact
-          path: |
-            flutter/lib/generated_bridge.dart
-            src/bridge_generated.rs
-            src/bridge_generated.io.rs
+  build-bridge:
+    uses: ./.github/workflows/bridge.yml
 
   build-android-libs:
-    needs: [generate-bridge]
+    needs: [build-bridge]
     name: Build Rust lib ${{ matrix.job.target }}
     runs-on: ubuntu-24.04
     strategy:
@@ -145,7 +107,7 @@ jobs:
           path: ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
 
   build-apks:
-    needs: [generate-bridge, build-android-libs]
+    needs: [build-bridge, build-android-libs]
     name: Package and Sign APKs
     runs-on: ubuntu-24.04
     steps:
