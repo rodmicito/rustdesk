@@ -1,0 +1,264 @@
+name: Build RustDesk Android Standalone
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  FLUTTER_VERSION: "3.24.5"
+  RUST_VERSION: "1.75"
+  NDK_VERSION: "r28c"
+  CARGO_NDK_VERSION: "3.1.2"
+  VERSION: "1.5.3"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  ARMV7_VCPKG_COMMIT_ID: "6f29f12e82a8293156836ad81cc9bf5af41fe836"
+
+jobs:
+  generate-bridge:
+    name: Generate Flutter Rust Bridge
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Generate bridge
+        run: |
+          cargo install flutter_rust_bridge_codegen --version 1.80.1 --locked
+          flutter_rust_bridge_codegen --rust-input src/flutter_ffi.rs --dart-output flutter/lib/generated_bridge.dart --rust-output src/bridge_generated.rs --class-name PlatformFFI
+          git status --porcelain
+
+      - name: Upload bridge files
+        uses: actions/upload-artifact@v4
+        with:
+          name: bridge-artifact
+          path: |
+            flutter/lib/generated_bridge.dart
+            src/bridge_generated.rs
+            src/bridge_generated.io.rs
+
+  build-android-libs:
+    needs: [generate-bridge]
+    name: Build Rust lib ${{ matrix.job.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { arch: aarch64, target: aarch64-linux-android, abi: arm64-v8a }
+          - { arch: armv7, target: armv7-linux-androideabi, abi: armeabi-v7a }
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake curl gcc-multilib git g++ g++-multilib ninja-build pkg-config nasm openjdk-17-jdk-headless
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Setup vcpkg cache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Build vcpkg dependencies
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./flutter/build_android_deps.sh "${{ matrix.job.abi }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ matrix.job.target }}
+
+      - name: Build rustdesk lib
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          case ${{ matrix.job.target }} in
+            aarch64-linux-android)
+              ./flutter/ndk_arm64.sh
+              ;;
+            armv7-linux-androideabi)
+              ./flutter/ndk_arm.sh
+              ;;
+          esac
+
+      - name: Upload native library
+        uses: actions/upload-artifact@v4
+        with:
+          name: librustdesk-${{ matrix.job.arch }}
+          path: ./target/${{ matrix.job.target }}/release/liblibrustdesk.so
+
+  build-apks:
+    needs: [generate-bridge, build-android-libs]
+    name: Package and Sign APKs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk-headless
+
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Download bridge files
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Download arm64 native lib
+        uses: actions/download-artifact@v4
+        with:
+          name: librustdesk-aarch64
+          path: ./flutter/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Download armv7 native lib
+        uses: actions/download-artifact@v4
+        with:
+          name: librustdesk-armv7
+          path: ./flutter/android/app/src/main/jniLibs/armeabi-v7a
+
+      - name: Prepare native libraries
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          # Rename and add libc++_shared.so
+          mv ./flutter/android/app/src/main/jniLibs/arm64-v8a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so ./flutter/android/app/src/main/jniLibs/arm64-v8a/
+
+          mv ./flutter/android/app/src/main/jniLibs/armeabi-v7a/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/librustdesk.so
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/arm-linux-androideabi/libc++_shared.so ./flutter/android/app/src/main/jniLibs/armeabi-v7a/
+
+          # Adjust Gradle memory & set signing to debug (valid signed keystore)
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+
+      - name: Build APKs (Universal + Split per ABI)
+        run: |
+          pushd flutter
+          # 1. Universal APK (arm64 + armv7)
+          flutter build apk --release --target-platform android-arm,android-arm64
+          mv build/app/outputs/flutter-apk/app-release.apk ../rustdesk-${{ env.VERSION }}-universal-signed.apk
+
+          # 2. aarch64 split APK
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ../rustdesk-${{ env.VERSION }}-aarch64-signed.apk
+
+          # 3. armv7 split APK
+          flutter build apk --release --target-platform android-arm --split-per-abi
+          mv build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk ../rustdesk-${{ env.VERSION }}-armv7-signed.apk
+          popd
+
+      - name: Sign APKs with Android Keystore
+        uses: r0adkll/sign-android-release@v1
+        id: sign-android
+        with:
+          releaseDirectory: ./
+          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY }}
+          alias: ${{ secrets.ANDROID_ALIAS }}
+          keyStorePassword: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-apks
+          path: |
+            rustdesk-${{ env.VERSION }}-universal-signed.apk
+            rustdesk-${{ env.VERSION }}-aarch64-signed.apk
+            rustdesk-${{ env.VERSION }}-armv7-signed.apk
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: custom-1.5.3
+          prerelease: true
+          files: |
+            rustdesk-${{ env.VERSION }}-universal-signed.apk
+            rustdesk-${{ env.VERSION }}-aarch64-signed.apk
+            rustdesk-${{ env.VERSION }}-armv7-signed.apk
